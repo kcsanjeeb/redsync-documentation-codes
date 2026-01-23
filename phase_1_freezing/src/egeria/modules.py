@@ -43,3 +43,50 @@ def unfreeze_module(mod: nn.Module):
     for m in mod.modules():
         if isinstance(m, nn.BatchNorm2d):
             m.train()
+
+
+def forward_through_modules(modules, x, stop_at=None):
+    """
+    Runs x through modules in order.
+    If stop_at is not None, returns (out, activation_at_stop)
+    where activation_at_stop is output after modules[stop_at].
+    """
+    act = None
+    out = x
+    for i, m in enumerate(modules):
+        out = m(out)
+        if stop_at is not None and i == stop_at:
+            act = out
+    return out, act
+
+
+def forward_modules(modules: List[torch.nn.Module], x: torch.Tensor, start: int = 0, end: int = None) -> torch.Tensor:
+    """Run modules[start:end] sequentially."""
+    if end is None:
+        end = len(modules)
+    for i in range(start, end):
+        x = modules[i](x)
+    return x
+
+def forward_with_frozen_prefix(
+    modules: List[torch.nn.Module],
+    x: torch.Tensor,
+    frozen_upto: int,
+) -> torch.Tensor:
+    """
+    If frozen_upto >= 0, run prefix [0..frozen_upto] under no_grad, then detach boundary activation.
+    Then run remaining modules with grad.
+    """
+    if frozen_upto < 0:
+        return forward_modules(modules, x, 0, None)
+
+    # Prefix: no_grad (no autograd graph, no backward)
+    with torch.no_grad():
+        h = forward_modules(modules, x, 0, frozen_upto + 1)
+
+    # Important: boundary tensor is treated as constant input to suffix
+    h = h.detach()
+
+    # Suffix: normal grad
+    out = forward_modules(modules, h, frozen_upto + 1, None)
+    return out
