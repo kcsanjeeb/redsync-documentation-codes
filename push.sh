@@ -9,8 +9,8 @@ if ! git rev-parse --git-dir > /dev/null 2>&1; then
     exit 1
 fi
 
-# Check for changes
-if git diff-index --quiet HEAD --; then
+# Better check for changes (including untracked files)
+if [ -z "$(git status --porcelain)" ]; then
     echo "ℹ️  No changes to commit"
     exit 0
 fi
