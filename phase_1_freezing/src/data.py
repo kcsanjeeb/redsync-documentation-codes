@@ -1,0 +1,100 @@
+# import torch
+# from torchvision import datasets, transforms
+#
+# def cifar10_loaders(data_dir="./data", batch_size=128, num_workers=4):
+#     mean = (0.4914, 0.4822, 0.4465)
+#     std  = (0.2470, 0.2435, 0.2616)
+#
+#     train_tf = transforms.Compose([
+#         transforms.RandomCrop(32, padding=4),
+#         transforms.RandomHorizontalFlip(),
+#         transforms.ToTensor(),
+#         transforms.Normalize(mean, std),
+#     ])
+#
+#     test_tf = transforms.Compose([
+#         transforms.ToTensor(),
+#         transforms.Normalize(mean, std),
+#     ])
+#
+#     train_ds = datasets.CIFAR10(root=data_dir, train=True, download=True, transform=train_tf)
+#     test_ds  = datasets.CIFAR10(root=data_dir, train=False, download=True, transform=test_tf)
+#
+#     train_loader = torch.utils.data.DataLoader(
+#         train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+#         pin_memory=True, drop_last=True
+#     )
+#     test_loader = torch.utils.data.DataLoader(
+#         test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+#         pin_memory=True
+#     )
+#     return train_loader, test_loader
+
+#  -------------------- NEXT WORK ------------------------
+
+import torch
+from torchvision import datasets, transforms
+
+def cifar10_loaders(
+    data_dir="./data",
+    batch_size=128,
+    num_workers=4,
+    pin_memory=True,
+    no_aug=False,
+):
+    mean = (0.4914, 0.4822, 0.4465)
+    std  = (0.2470, 0.2435, 0.2616)
+
+    if no_aug:
+        # Deterministic preprocessing (required for feature caching)
+        train_tf = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+    else:
+        # Standard CIFAR-10 augmentation
+        train_tf = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean, std),
+        ])
+
+    test_tf = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ])
+
+    train_ds = datasets.CIFAR10(
+        root=data_dir,
+        train=True,
+        download=True,
+        transform=train_tf,
+    )
+    test_ds = datasets.CIFAR10(
+        root=data_dir,
+        train=False,
+        download=True,
+        transform=test_tf,
+    )
+
+    train_loader = torch.utils.data.DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=True,
+        persistent_workers=(num_workers > 0),
+    )
+
+    test_loader = torch.utils.data.DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=(num_workers > 0),
+    )
+
+    return train_loader, test_loader
