@@ -1,4 +1,4 @@
-# src/train_freeze_phase2_async_fixed_fc_naive_v3.py
+# src/train_freeze_phase2_async_fixed_fc_reuse_gated_v4.py
 import argparse
 import json
 import os
@@ -318,6 +318,28 @@ def train_one_epoch(
 
 
 # ----------------------------
+# EMA helpers (Phase-3D gating)
+# ----------------------------
+def ema_update(cur: Optional[float], x: float, alpha: float) -> float:
+    if cur is None:
+        return float(x)
+    return float(alpha * x + (1.0 - alpha) * cur)
+
+
+def sum_overhead_from_fc_log(log: Dict[str, Any]) -> float:
+    """
+    FeatureCache returns logs that may include timing fields.
+    We conservatively sum known fields if present.
+    """
+    s = 0.0
+    for k in ("d2h_s", "h2d_s", "serialize_s", "deserialize_s", "compress_s", "decompress_s"):
+        if k in log and log[k] is not None:
+            s += float(log[k])
+    # some implementations store nested keys; handled in caller
+    return float(s)
+
+
+# ----------------------------
 # Main
 # ----------------------------
 def main():
@@ -352,13 +374,27 @@ def main():
     ap.add_argument("--log_path", type=str, default="runs/train.jsonl")
     ap.add_argument("--debug_decisions", action="store_true")
 
-    # -------- FeatureCache (naive overhead path) --------
+    # -------- FeatureCache --------
     ap.add_argument("--feature_cache", action="store_true")
     ap.add_argument("--fc_codec", type=str, default="zstd")
     ap.add_argument("--fc_level", type=int, default=3)
     ap.add_argument("--fc_pin_memory", action="store_true")
     ap.add_argument("--fc_max_items", type=int, default=256)
     ap.add_argument("--fc_enable_after_freeze_k", type=int, default=1)
+
+    # -------- Phase-3D gated reuse controls --------
+    ap.add_argument("--reuse_gated", action="store_true",
+                    help="Enable Phase-3D: gated reuse on cache hit (skip probe forward if break-even).")
+    ap.add_argument("--gate_alpha", type=float, default=0.10,
+                    help="EMA alpha for p_hit / fwd_ms / overhead_s.")
+    ap.add_argument("--gate_margin", type=float, default=0.20,
+                    help="Safety margin: require benefit > overhead*(1+margin).")
+    ap.add_argument("--gate_min_obs", type=int, default=10,
+                    help="Minimum hit/miss observations at boundary before enabling gated reuse.")
+    ap.add_argument("--gate_min_phit", type=float, default=0.50,
+                    help="Minimum p_hit EMA required before gating can pass (stability).")
+    ap.add_argument("--gate_warmup_capture", type=int, default=1,
+                    help="On first ever encounter, force a capture path even if key exists (debug).")
 
     args = ap.parse_args()
 
@@ -434,6 +470,15 @@ def main():
             max_entries=args.fc_max_items,
         )
 
+    # Phase-3D gating state (per boundary)
+    p_hit_ema: Dict[int, Optional[float]] = {}
+    obs_cnt: Dict[int, int] = {}
+    probe_fwd_ms_ema: Dict[int, Optional[float]] = {}
+    fc_load_overhead_s_ema: Dict[int, Optional[float]] = {}
+
+    # For debugging / forcing a capture first time
+    seen_boundary: Dict[int, int] = {}
+
     frozen_upto = -1
     last_freeze_epoch = -1
     silent_ctr = 0
@@ -483,7 +528,9 @@ def main():
         ckpt_saved = False
         cache_log: Dict[str, Any] = {}
 
-        # PROBE + FeatureCache
+        # ----------------------------
+        # PROBE + FeatureCache (+ Phase-3D gated reuse)
+        # ----------------------------
         if epoch >= args.bootstrap_epochs and args.probe_every_epochs > 0 and epoch % args.probe_every_epochs == 0:
             probe = True
             next_idx = min(frozen_upto + 1, total_units - 1)
@@ -492,43 +539,156 @@ def main():
             with torch.no_grad():
                 xb, _ = next(iter(probe_loader))
                 xb = xb.to(device)
-                _, act = boundary_model.forward_with_boundary(xb, boundary_idx=next_idx)
-                act = act.detach()
 
                 frozen_k = frozen_upto + 1
                 do_fc = (fc is not None) and (frozen_k >= args.fc_enable_after_freeze_k)
 
-                # IMPORTANT:
-                # - capture() must receive GPU tensor to measure D2H
-                # - load() will measure H2D
-                # - use real hit/miss behavior: if key exists -> load, else capture
                 if do_fc:
-                    key = f"probe_b{next_idx}"  # stable key => hits after first capture
+                    key = f"probe_b{next_idx}"  # stable key -> hits after first capture
+                    cache_log["fc_enabled"] = True
+                    cache_log["fc_key"] = key
+                    cache_log["fc_hit_rate"] = fc.hit_rate()
 
-                    fc_t0 = time.perf_counter()
+                    # Init gate state
+                    if next_idx not in p_hit_ema:
+                        p_hit_ema[next_idx] = None
+                        obs_cnt[next_idx] = 0
+                        probe_fwd_ms_ema[next_idx] = None
+                        fc_load_overhead_s_ema[next_idx] = None
+                        seen_boundary[next_idx] = 0
+
+                    seen_boundary[next_idx] += 1
+
+                    # ---------- Option A: cache hit path ----------
                     if fc.has(key):
+                        obs_cnt[next_idx] += 1
+                        p_hit_ema[next_idx] = ema_update(p_hit_ema[next_idx], 1.0, args.gate_alpha)
+
+                        # Always measure load overhead on a hit (we need this for the gate)
+                        fc_t0 = time.perf_counter()
                         load_log = fc.load(key, device=device)
                         act_loaded = load_log.pop("act")
-                        cache_log = {
-                            "fc_enabled": True,
-                            "fc_key": key,
-                            "fc_mode": "hit_load",
-                            "fc_hit_rate": fc.hit_rate(),
-                            "fc_load": {k: v for k, v in load_log.items() if k != "act"},
-                        }
-                        act_to_send = act_loaded.to("cpu", dtype=torch.float32).contiguous()
-                    else:
-                        cap_log = fc.capture(key, act)  # <-- GPU tensor
-                        cache_log = {
-                            "fc_enabled": True,
-                            "fc_key": key,
-                            "fc_mode": "miss_capture",
-                            "fc_hit_rate": fc.hit_rate(),
-                            "fc_capture": {k: v for k, v in cap_log.items() if k != "act"},
-                        }
-                        act_to_send = act.to("cpu", dtype=torch.float32).contiguous()
+                        fc_total_s = time.perf_counter() - fc_t0
 
-                    cache_log["fc_total_probe_path_s"] = time.perf_counter() - fc_t0
+                        # Extract overhead sum (support both flat and nested logs)
+                        overhead_s = 0.0
+                        overhead_s += sum_overhead_from_fc_log(load_log)
+                        if "timings" in load_log and isinstance(load_log["timings"], dict):
+                            overhead_s += sum_overhead_from_fc_log(load_log["timings"])
+
+                        fc_load_overhead_s_ema[next_idx] = ema_update(
+                            fc_load_overhead_s_ema[next_idx],
+                            overhead_s,
+                            args.gate_alpha
+                        )
+
+                        # Decide whether to SKIP probe forward
+                        gate_ok = False
+                        reason = "gate_disabled"
+                        if args.reuse_gated:
+                            if obs_cnt[next_idx] < args.gate_min_obs:
+                                gate_ok = False
+                                reason = f"gate_wait_obs:{obs_cnt[next_idx]}/{args.gate_min_obs}"
+                            elif (p_hit_ema[next_idx] is not None) and (p_hit_ema[next_idx] < args.gate_min_phit):
+                                gate_ok = False
+                                reason = f"gate_low_phit:{p_hit_ema[next_idx]:.3f}<{args.gate_min_phit}"
+                            elif probe_fwd_ms_ema[next_idx] is None:
+                                gate_ok = False
+                                reason = "gate_no_fwd_profile"
+                            else:
+                                # benefit = p_hit * saved_forward
+                                p = float(p_hit_ema[next_idx] or 0.0)
+                                saved_s = float(probe_fwd_ms_ema[next_idx]) / 1000.0
+                                cost_s = float(fc_load_overhead_s_ema[next_idx] or overhead_s)
+                                gate_ok = (p * saved_s) > (cost_s * (1.0 + args.gate_margin))
+                                reason = "gate_pass" if gate_ok else "gate_fail_break_even"
+
+                        # Optional: force first encounter to be capture-like (debug)
+                        if args.gate_warmup_capture > 0 and seen_boundary[next_idx] <= args.gate_warmup_capture:
+                            gate_ok = False
+                            reason = f"gate_forced_warmup:{seen_boundary[next_idx]}/{args.gate_warmup_capture}"
+
+                        cache_log.update({
+                            "fc_mode": "hit_load",
+                            "fc_total_probe_path_s": fc_total_s,
+                            "fc_load": {k: v for k, v in load_log.items() if k != "act"},
+                            "gate": {
+                                "enabled": bool(args.reuse_gated),
+                                "ok": bool(gate_ok),
+                                "reason": reason,
+                                "p_hit_ema": p_hit_ema[next_idx],
+                                "obs_cnt": obs_cnt[next_idx],
+                                "probe_fwd_ms_ema": probe_fwd_ms_ema[next_idx],
+                                "fc_load_overhead_s_ema": fc_load_overhead_s_ema[next_idx],
+                                "gate_margin": args.gate_margin,
+                            }
+                        })
+
+                        if gate_ok:
+                            # TRUE REUSE: skip any model forward; send cached activation
+                            act_to_send = act_loaded.detach().to("cpu", dtype=torch.float32).contiguous()
+                        else:
+                            # Gate failed -> compute probe forward (like v3) to keep controller honest
+                            torch.cuda.synchronize(device) if device.type == "cuda" else None
+                            ev0 = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
+                            ev1 = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
+
+                            if ev0 is not None:
+                                ev0.record()
+                            _, act = boundary_model.forward_with_boundary(xb, boundary_idx=next_idx)
+                            if ev1 is not None:
+                                ev1.record()
+                                torch.cuda.synchronize()
+                                fwd_ms = float(ev0.elapsed_time(ev1))
+                                probe_fwd_ms_ema[next_idx] = ema_update(probe_fwd_ms_ema[next_idx], fwd_ms, args.gate_alpha)
+                                cache_log["probe_forward_ms"] = fwd_ms
+                                cache_log["probe_forward_ms_ema"] = probe_fwd_ms_ema[next_idx]
+
+                            act = act.detach()
+                            act_to_send = act.to("cpu", dtype=torch.float32).contiguous()
+
+                    # ---------- Option B: cache miss path ----------
+                    else:
+                        obs_cnt[next_idx] += 1
+                        p_hit_ema[next_idx] = ema_update(p_hit_ema[next_idx], 0.0, args.gate_alpha)
+
+                        # Must run probe forward (to get act)
+                        torch.cuda.synchronize(device) if device.type == "cuda" else None
+                        ev0 = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
+                        ev1 = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
+
+                        if ev0 is not None:
+                            ev0.record()
+                        _, act = boundary_model.forward_with_boundary(xb, boundary_idx=next_idx)
+                        if ev1 is not None:
+                            ev1.record()
+                            torch.cuda.synchronize()
+                            fwd_ms = float(ev0.elapsed_time(ev1))
+                            probe_fwd_ms_ema[next_idx] = ema_update(probe_fwd_ms_ema[next_idx], fwd_ms, args.gate_alpha)
+                            cache_log["probe_forward_ms"] = fwd_ms
+                            cache_log["probe_forward_ms_ema"] = probe_fwd_ms_ema[next_idx]
+
+                        act = act.detach()
+
+                        fc_t0 = time.perf_counter()
+                        cap_log = fc.capture(key, act)  # GPU tensor -> measure D2H + serialize + compress
+                        fc_total_s = time.perf_counter() - fc_t0
+
+                        cache_log.update({
+                            "fc_mode": "miss_capture",
+                            "fc_total_probe_path_s": fc_total_s,
+                            "fc_capture": {k: v for k, v in cap_log.items() if k != "act"},
+                            "gate": {
+                                "enabled": bool(args.reuse_gated),
+                                "ok": False,
+                                "reason": "miss",
+                                "p_hit_ema": p_hit_ema[next_idx],
+                                "obs_cnt": obs_cnt[next_idx],
+                                "probe_fwd_ms_ema": probe_fwd_ms_ema[next_idx],
+                            }
+                        })
+
+                        act_to_send = act.to("cpu", dtype=torch.float32).contiguous()
 
                     # cumulative stats snapshot
                     st = fc.stats
@@ -544,9 +704,12 @@ def main():
                         "compress_s": st.compress_s,
                         "decompress_s": st.decompress_s,
                     }
+
                 else:
+                    # No FeatureCache: just compute act and send
                     cache_log = {"fc_enabled": False}
-                    act_to_send = act.to("cpu", dtype=torch.float32).contiguous()
+                    _, act = boundary_model.forward_with_boundary(xb, boundary_idx=next_idx)
+                    act_to_send = act.detach().to("cpu", dtype=torch.float32).contiguous()
 
                 msg = ProbeMsg(
                     boundary_idx=int(next_idx),
@@ -560,6 +723,7 @@ def main():
                 except queue.Full:
                     pass
 
+        # Apply freezes
         dec, _ = drain_and_apply_freezes(epoch)
         if dec is None:
             silent_ctr += 1
@@ -569,6 +733,7 @@ def main():
 
         frozen_k = frozen_upto + 1
 
+        # Optional checkpoint save
         if args.save_ckpt_on_freeze_k > 0 and frozen_k == args.save_ckpt_on_freeze_k and last_freeze_epoch == epoch:
             ensure_dir(args.ckpt_path)
             torch.save(

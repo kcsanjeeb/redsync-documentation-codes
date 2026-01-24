@@ -1,0 +1,18 @@
+python -u -m src.train_freeze_phase2_async_fixed_v2 \
+  --epochs 200 \
+  --batch_size 128 \
+  --bootstrap_epochs 120 \
+  --probe_bs 64 \
+  --probe_every_epochs 1 \
+  --W 10 \
+  --slope_T 8e-4 \
+  --required_hits 3 \
+  --ref_update_every_epochs 20 \
+  --max_freeze_modules 8 \
+  --no_aug \
+  --cpu_threads 4 \
+  --save_ckpt_on_freeze_k 8 \
+  --stop_after_freeze_k 8 \
+  --ckpt_path runs/checkpoints/egeria_noaug_k8_fixed_v2.pt \
+  --log_path runs/phase_2/phase_2A/phase_2A-train.jsonl \
+  --debug_decisions
